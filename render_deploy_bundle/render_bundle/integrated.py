@@ -4,6 +4,7 @@ import threading
 import json
 import hmac
 import hashlib
+import ipaddress
 import subprocess
 import hmac
 import secrets
@@ -68,6 +69,68 @@ VERIFY_GUILD_ID = os.getenv("VERIFY_GUILD_ID", "").strip()
 VERIFY_ROLE_ID = os.getenv("VERIFY_ROLE_ID", "").strip()
 
 IP_RETENTION_DAYS = 30
+
+# Optional IP reputation screening. Configure IPQS_API_KEY in Render Environment.
+# Country allowlist defaults to South Korea; comma-separated ISO-3166-1 alpha-2 codes.
+IPQS_API_KEY = os.getenv("IPQS_API_KEY", "").strip()
+IP_ALLOWED_COUNTRIES = {
+    item.strip().upper()
+    for item in os.getenv("IP_ALLOWED_COUNTRIES", "KR").split(",")
+    if item.strip()
+}
+BLOCK_FOREIGN_IPS = os.getenv("BLOCK_FOREIGN_IPS", "1").strip().lower() not in ("0", "false", "no", "off")
+BLOCK_VPN = os.getenv("BLOCK_VPN", "1").strip().lower() not in ("0", "false", "no", "off")
+BLOCK_PROXY = os.getenv("BLOCK_PROXY", "1").strip().lower() not in ("0", "false", "no", "off")
+BLOCK_TOR = os.getenv("BLOCK_TOR", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def inspect_ip_reputation(ip_address):
+    """Return (blocked, reason, details). Unknown/private IPs fail open safely."""
+    try:
+        parsed = ipaddress.ip_address(ip_address)
+    except (TypeError, ValueError):
+        return False, "IP 주소를 확인할 수 없음", {"status": "invalid_ip"}
+
+    # Render's internal/private proxy address is not the visitor's public IP.
+    if not parsed.is_global:
+        return False, "공인 IP가 아닌 내부/예약 IP", {"status": "non_public_ip"}
+
+    if not IPQS_API_KEY:
+        return False, "IP 평판 API 키 미설정", {"status": "api_key_missing"}
+
+    try:
+        response = requests.get(
+            f"https://ipqualityscore.com/api/json/ip/{IPQS_API_KEY}/{parsed.compressed}",
+            params={"strictness": 1, "allow_public_access_points": "true"},
+            timeout=5
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("success"):
+            return False, "IP 평판 조회 실패", {"status": "provider_error"}
+
+        country = str(data.get("country_code") or "").upper()
+        vpn = bool(data.get("vpn") or data.get("active_vpn"))
+        proxy = bool(data.get("proxy"))
+        tor = bool(data.get("tor") or data.get("active_tor"))
+        reasons = []
+        if BLOCK_FOREIGN_IPS and IP_ALLOWED_COUNTRIES and country not in IP_ALLOWED_COUNTRIES:
+            reasons.append(f"허용되지 않은 국가({country or '국가 미확인'})")
+        if BLOCK_VPN and vpn:
+            reasons.append("VPN 접속 감지")
+        if BLOCK_PROXY and proxy:
+            reasons.append("프록시 접속 감지")
+        if BLOCK_TOR and tor:
+            reasons.append("Tor 접속 감지")
+        details = {
+            "status": "checked", "country": country,
+            "vpn": vpn, "proxy": proxy, "tor": tor,
+            "fraud_score": data.get("fraud_score")
+        }
+        return bool(reasons), ", ".join(reasons), details
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        # Do not lock out all legitimate users when the reputation provider is down.
+        return False, "IP 평판 조회 서비스 일시 오류", {"status": type(exc).__name__}
 
 def init_db():
     with sqlite3.connect(DB) as con:
@@ -699,6 +762,19 @@ def callback():
             )
             return "접속이 차단되었습니다. 관리자에게 문의해 주세요.", 403
 
+        reputation_blocked, reputation_reason, reputation_details = inspect_ip_reputation(current_ip)
+        if reputation_blocked:
+            send_discord_alert(
+                "🚫 해외/VPN/프록시 IP 인증 차단",
+                f"IP: `{current_ip}`\n차단 사유: {reputation_reason}\n"
+                f"국가: `{reputation_details.get('country', '확인 불가')}`\n"
+                f"VPN: `{reputation_details.get('vpn')}` / 프록시: `{reputation_details.get('proxy')}` / "
+                f"Tor: `{reputation_details.get('tor')}`",
+                0xED4245,
+                channel_id=get_alert_channel("ip")
+            )
+            return "해외 네트워크 또는 VPN/프록시 접속은 허용되지 않습니다.", 403
+
     try:
         r = requests.post(
             API + "/oauth2/token",
@@ -929,7 +1005,7 @@ def panel():
       <h1>통합 사이트 관리자</h1>
       <p>사이트 인증 기록, Discord 서버, 블랙리스트를 한 곳에서 관리합니다.</p>
       <p><a href="/admin/servers">Discord 서버 관리</a> ·
-         <a href="/admin/blacklist">블랙리스트 관리</a> · <a href="/admin/settings">알림 채널 설정</a> ·
+         <a href="/admin/blacklist">블랙리스트 관리</a> · <a href="/admin/settings">알림 채널 설정</a> · <a href="/admin/ip-diagnostics">IP 진단</a> ·
          <a href="/admin/logout">로그아웃</a></p>
       <hr><h2>인증 기록 ({{ rows|length }}건)</h2>
       {% for r in rows %}
@@ -1264,6 +1340,27 @@ def alert_settings_admin():
       </form>
     </div></html>
     """, blacklist_value=blacklist_value, ip_value=ip_value)
+@app.route("/admin/ip-diagnostics")
+@admin_required
+def ip_diagnostics():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return render_template_string("""
+    <html lang="ko"><meta charset="UTF-8">
+    """ + STYLE + """
+    <div class="card" style="max-width:760px;text-align:left">
+      <h1>IP / 프록시 진단</h1>
+      <p><a href="/admin/panel">관리자</a> · <a href="/admin/blacklist">블랙리스트</a></p>
+      <p><b>Flask가 인식한 접속 주소:</b> <code>{{ remote_addr }}</code></p>
+      <p><b>X-Forwarded-For:</b> <code>{{ forwarded or '헤더 없음' }}</code></p>
+      <p><b>접속 경로 목록:</b> <code>{{ access_route }}</code></p>
+      <p><b>IP 평판 API:</b> {{ '설정됨' if api_enabled else '미설정' }}</p>
+      <p>10.x.x.x, 172.16~31.x.x, 192.168.x.x처럼 내부 IP가 표시되면 실제 방문자 IP를 아직 판별하지 못한 상태입니다. 이 경우 국가/VPN 차단은 실행되지 않습니다.</p>
+    </div></html>
+    """, remote_addr=request.remote_addr or "없음",
+       forwarded=forwarded, access_route=list(request.access_route),
+       api_enabled=bool(IPQS_API_KEY))
+
+
 @app.route("/admin/logout")
 def logout():
     session.pop("admin", None)
