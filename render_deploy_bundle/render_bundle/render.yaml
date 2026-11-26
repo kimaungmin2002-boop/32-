@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: discord-oauth-integrated
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python integrated.py
+    healthCheckPath: /
+    disk:
+      name: integrated-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: SECURITY_LOG_KEY
+        generateValue: true
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: DISCORD_REDIRECT_URI
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: ALERT_CHANNEL_ID
+        sync: false
+      - key: VERIFY_URL
+        sync: false
+      - key: VERIFY_GUILD_ID
+        sync: false
+      - key: VERIFY_ROLE_ID
+        sync: false
+      - key: SECURITY_DB_PATH
+        value: /var/data/security.db
+      - key: SECURITY_EVENT_DB
+        value: /var/data/security_events.db
+      - key: SECURITY_BASELINE_DIR
+        value: /var/data
+      - key: NGROK_ENABLED
+        value: "0"
+      - key: RENDER
+        value: "true"
